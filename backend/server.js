@@ -7,12 +7,12 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
-const REGION = "ap-south-1"; // change if needed
+const REGION = process.env.AWS_REGION || "us-east-1";
+const ssm = new SSMClient({ region: REGION });
+
 let db;
 
-/* -------------------- AWS SSM CONFIG -------------------- */
-
-const ssm = new SSMClient({ region: REGION });
+/* ------------------ FETCH DB CONFIG FROM SSM ------------------ */
 
 async function getDBConfig() {
   const command = new GetParametersCommand({
@@ -25,50 +25,63 @@ async function getDBConfig() {
     WithDecryption: true
   });
 
-  const response = await ssm.send(command);
-
+  const res = await ssm.send(command);
   const params = {};
-  response.Parameters.forEach(p => {
-    const key = p.Name.split("/").pop();
-    params[key] = p.Value;
+
+  res.Parameters.forEach(p => {
+    params[p.Name.split("/").pop()] = p.Value;
   });
 
-  return {
-    host: params.host,
-    user: params.user,
-    password: params.password,
-    database: params.name
-  };
+  if (!params.host || !params.user || !params.password || !params.name) {
+    throw new Error("Missing DB parameters in SSM");
+  }
+
+  return params;
 }
 
-/* -------------------- DB CONNECTION WITH RETRY -------------------- */
+/* ------------------ CREATE DATABASE IF NOT EXISTS ------------------ */
+
+async function ensureDatabaseExists(config) {
+  const conn = await mysql.createConnection({
+    host: config.host,
+    user: config.user,
+    password: config.password
+  });
+
+  await conn.query(`CREATE DATABASE IF NOT EXISTS \`${config.name}\``);
+  await conn.end();
+  console.log("✅ Database verified");
+}
+
+/* ------------------ CONNECT TO DB ------------------ */
 
 async function connectWithRetry(retries = 10, delay = 3000) {
   for (let i = 1; i <= retries; i++) {
     try {
-      const dbConfig = await getDBConfig();
+      const cfg = await getDBConfig();
+
+      await ensureDatabaseExists(cfg);
 
       const pool = mysql.createPool({
-        host: dbConfig.host,
-        user: dbConfig.user,
-        password: dbConfig.password,
-        database: dbConfig.database,
+        host: cfg.host,
+        user: cfg.user,
+        password: cfg.password,
+        database: cfg.name,
         connectionLimit: 10,
         ssl: { rejectUnauthorized: false }
       });
 
-      console.log(`✅ Connected to RDS (Attempt ${i})`);
+      console.log("✅ Connected to RDS");
       return pool;
-
     } catch (err) {
-      console.error(`❌ DB connection failed (Attempt ${i})`, err.message);
+      console.error(`❌ DB connection failed (attempt ${i})`, err.message);
       if (i === retries) throw err;
-      await new Promise(res => setTimeout(res, delay));
+      await new Promise(r => setTimeout(r, delay));
     }
   }
 }
 
-/* -------------------- DB INIT -------------------- */
+/* ------------------ TABLE CREATION ------------------ */
 
 async function ensureTables(db) {
   await db.query(`
@@ -91,18 +104,14 @@ async function ensureTables(db) {
     )
   `);
 
-  console.log("✅ Tables verified");
+  console.log("✅ Tables ready");
 }
 
-/* -------------------- API ROUTES -------------------- */
+/* ------------------ ROUTES ------------------ */
 
 app.get("/", async (req, res) => {
-  try {
-    const [rows] = await db.query("SELECT * FROM student");
-    res.json({ message: "Backend is running 🚀", data: rows });
-  } catch (err) {
-    res.status(500).json({ error: "DB error" });
-  }
+  const [rows] = await db.query("SELECT * FROM student");
+  res.json({ message: "Backend running 🚀", data: rows });
 });
 
 app.get("/student", async (req, res) => {
@@ -116,38 +125,63 @@ app.get("/teacher", async (req, res) => {
 });
 
 app.post("/addstudent", async (req, res) => {
-  const { name, rollNo, class: className } = req.body;
-
+  const { name, rollNo, class: cls } = req.body;
   await db.query(
     "INSERT INTO student (name, roll_number, class) VALUES (?, ?, ?)",
-    [name, rollNo, className]
+    [name, rollNo, cls]
   );
-
   res.json({ message: "Student added" });
 });
 
 app.post("/addteacher", async (req, res) => {
-  const { name, subject, class: className } = req.body;
-
+  const { name, subject, class: cls } = req.body;
   await db.query(
     "INSERT INTO teacher (name, subject, class) VALUES (?, ?, ?)",
-    [name, subject, className]
+    [name, subject, cls]
   );
-
   res.json({ message: "Teacher added" });
 });
-
 app.delete("/student/:id", async (req, res) => {
-  await db.query("DELETE FROM student WHERE id = ?", [req.params.id]);
-  res.json({ message: "Student deleted" });
+  try {
+    const { id } = req.params;
+
+    const [result] = await db.query(
+      "DELETE FROM student WHERE id = ?",
+      [id]
+    );
+
+    if (result.affectedRows === 0) {
+      return res.status(404).json({ message: "Student not found" });
+    }
+
+    res.json({ message: "Student deleted successfully" });
+  } catch (err) {
+    console.error("Delete student error:", err);
+    res.status(500).json({ error: "Failed to delete student" });
+  }
 });
 
 app.delete("/teacher/:id", async (req, res) => {
-  await db.query("DELETE FROM teacher WHERE id = ?", [req.params.id]);
-  res.json({ message: "Teacher deleted" });
+  try {
+    const { id } = req.params;
+
+    const [result] = await db.query(
+      "DELETE FROM teacher WHERE id = ?",
+      [id]
+    );
+
+    if (result.affectedRows === 0) {
+      return res.status(404).json({ message: "Teacher not found" });
+    }
+
+    res.json({ message: "Teacher deleted successfully" });
+  } catch (err) {
+    console.error("Delete teacher error:", err);
+    res.status(500).json({ error: "Failed to delete teacher" });
+  }
 });
 
-/* -------------------- START SERVER -------------------- */
+/* ------------------ START SERVER ------------------ */
 
 (async () => {
   try {
