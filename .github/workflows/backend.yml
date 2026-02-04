@@ -1,4 +1,4 @@
-name: Backed Build & Push
+name: Backend Build & Push
 
 on:
   workflow_dispatch:
