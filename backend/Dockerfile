@@ -14,6 +14,8 @@ COPY . .
 
 FROM node:18-alpine
 
+RUN apk add --no-cache curl
+
 # Create non-root user for security
 RUN addgroup -S nodejs && adduser -S nodejs -G nodejs
 
